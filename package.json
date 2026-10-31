@@ -1,14 +1,15 @@
 {
   "name": "bedrock-lan-proxy",
-  "version": "1.0.0",
-  "description": "Make a remote Minecraft Bedrock server show up as a LAN game, using the NetherNet protocol",
+  "version": "2.0.0",
+  "description": "Make a remote Minecraft Bedrock server appear as a LAN game, using NetherNet end to end",
   "bin": {
     "bedrock-lan-proxy": "bin/bedrock-lan-proxy.js"
   },
   "main": "src/proxy.js",
   "files": [
     "bin",
-    "src"
+    "src",
+    "stubs"
   ],
   "scripts": {
     "start": "node bin/bedrock-lan-proxy.js",
@@ -25,9 +26,14 @@
   "license": "MIT",
   "dependencies": {
     "bedrock-protocol": "^3.61.0",
-    "nethernet": "^1.1.2"
+    "nethernet": "github:PrismarineJS/node-nethernet#6431f0f98a4c82d919e59fdbdb54e576e939b9dd"
   },
   "engines": {
     "node": ">=24"
+  },
+  "overrides": {
+    "nethernet": "$nethernet",
+    "raknet-native": "file:./stubs/raknet-native",
+    "raknet-node": "file:./stubs/raknet-node"
   }
 }

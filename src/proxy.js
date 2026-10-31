@@ -1,71 +1,59 @@
 'use strict'
 
-// A LAN-facing NetherNet server that relays each Bedrock client to a remote server.
+// A LAN-facing NetherNet server that relays each Bedrock client to a remote server,
+// using NetherNet on both sides:
 //
-//   Bedrock client ──NetherNet/WebRTC (LAN, UDP 7551)──▶ proxy ──RakNet──▶ remote server
+//   Bedrock client ──NetherNet, LAN signalling (UDP 7551)──▶ proxy
+//   proxy ──NetherNet, HTTP signalling (TCP game port) + WebRTC (UDP)──▶ remote server
 //
-// node-nethernet handles LAN discovery, signalling and the WebRTC data channels.
-// bedrock-protocol's Relay sits on top of it: it terminates each client's game session
-// and opens a matching session to the remote server. Raw byte forwarding is not possible
-// because NetherNet sessions have no 0xFE batch header and no game-layer encryption,
-// while a RakNet server expects both.
+// node-nethernet handles discovery, signalling and the WebRTC data channels on both
+// sides. bedrock-protocol's Relay terminates each client's game session and opens a
+// matching session to the remote as that player. (A login is signed for the server it's
+// sent to, so it can't simply be forwarded.)
 
 const { EventEmitter } = require('node:events')
 const path = require('node:path')
 const os = require('node:os')
 const { Relay } = require('bedrock-protocol')
+const { pingHttp } = require('nethernet')
 const bpOptions = require('bedrock-protocol/src/options')
-const initRaknet = require('bedrock-protocol/src/rak')
-const { fromServerName } = require('bedrock-protocol/src/server/advertisement')
+const { installHttpSignalling } = require('./upstream')
+const { createServerTrust } = require('./trust')
+
 const { Versions, CURRENT_VERSION } = bpOptions
 const MIN_PROTOCOL = Versions[bpOptions.MIN_VERSION] // MIN_VERSION is a version string
 
-const DEFAULT_PROFILES = path.join(os.homedir(), '.bedrock-lan-proxy', 'auth')
+const STATE_DIR = path.join(os.homedir(), '.bedrock-lan-proxy')
+const DEFAULT_PROFILES = path.join(STATE_DIR, 'auth')
+const DEFAULT_TRUST_FILE = path.join(STATE_DIR, 'known_servers.json')
+const GAME_TYPES = { survival: 0, creative: 1, adventure: 2, spectator: 6 }
 
-/**
- * The upstream link to the remote is RakNet. raknet-native is faster but only ships
- * prebuilt binaries for a few OS versions; jsp-raknet is pure JavaScript and always works.
- */
-function pickRaknetBackend (requested = 'auto') {
-  if (requested !== 'auto') return requested
-  try {
-    require('raknet-native')
-    return 'raknet-native'
-  } catch {
-    return 'jsp-raknet'
-  }
+installHttpSignalling()
+
+/** The HTTP signalling origin for a remote: http://host:port, or a URL the user gave. */
+function remoteOrigin (host, port) {
+  if (/^https?:\/\//i.test(host)) return new URL(host).origin
+  const h = host.includes(':') ? `[${host}]` : host // bare IPv6
+  return `http://${h}:${port}`
 }
 
-let raknetBackend = pickRaknetBackend()
-
-function useRaknetBackend (name) {
-  raknetBackend = pickRaknetBackend(name)
-  initRaknet(raknetBackend) // throws now rather than mid-join if the backend can't load
-  // Relay doesn't pass raknetBackend through to its upstream Client, which falls back
-  // to bedrock-protocol's shared defaults, so set it there.
-  bpOptions.defaultOptions.raknetBackend = raknetBackend
-  return raknetBackend
-}
-
-/** Ask a RakNet Bedrock server for its MOTD, version and player counts. */
-async function pingRemote (host, port, timeout = 3000) {
-  const { RakClient } = initRaknet(raknetBackend)
-  const con = new RakClient({ host, port, useWorkers: false })
-  let reply
-  try {
-    reply = await con.ping(timeout)
-  } finally {
-    try { con.close() } catch {}
+/** Ask a NetherNet server for its name, version and player counts (GET /v1/join). */
+async function pingRemote (origin, timeout = 3000) {
+  const m = await pingHttp(origin, { timeout })
+  if (!m.raw) {
+    // Reachable, but the server publishes no metadata (BDS with LAN visibility off).
+    return { reachable: true }
   }
-  const ad = fromServerName(Buffer.isBuffer(reply) ? reply.toString() : String(reply))
+  const gameType = typeof m.gameType === 'string' ? GAME_TYPES[m.gameType.toLowerCase()] : m.gameType
   return {
-    motd: ad.motd,
-    levelName: ad.levelName,
-    protocol: Number(ad.protocol),
-    version: ad.version,
-    playersOnline: Number(ad.playersOnline) || 0,
-    playersMax: Number(ad.playersMax) || 0,
-    gamemodeId: Number(ad.gamemodeId) || 0
+    reachable: true,
+    motd: m.name,
+    levelName: m.level,
+    protocol: Number(m.protocol) || undefined,
+    version: m.version,
+    playersOnline: Number(m.players) || 0,
+    playersMax: Number(m.maxPlayers) || 0,
+    gamemodeId: Number(gameType) || 0
   }
 }
 
@@ -78,7 +66,7 @@ function resolveVersion (requested, remote) {
     if (!Versions[requested] || Versions[requested] < MIN_PROTOCOL) throw new Error(`Unsupported game version ${requested}. Supported: ${supportedVersions().join(', ')}`)
     return { version: requested, how: 'from --game-version' }
   }
-  if (remote) {
+  if (remote?.version || remote?.protocol) {
     if (Versions[remote.version] && Versions[remote.version] >= MIN_PROTOCOL) {
       return { version: remote.version, how: 'matched remote server' }
     }
@@ -89,11 +77,12 @@ function resolveVersion (requested, remote) {
     }
     return {
       version: CURRENT_VERSION,
-      how: `remote reports ${remote.version} (protocol ${remote.protocol}), which bedrock-protocol does not support; using ${CURRENT_VERSION}`,
+      how: `remote reports ${remote.version ?? '?'} (protocol ${remote.protocol ?? '?'}), which bedrock-protocol does not support; using ${CURRENT_VERSION}`,
       warn: true
     }
   }
-  return { version: CURRENT_VERSION, how: 'remote did not answer ping; using newest supported', warn: true }
+  const why = remote ? 'remote publishes no version' : 'remote did not answer'
+  return { version: CURRENT_VERSION, how: `${why}; using newest supported`, warn: true }
 }
 
 function supportedVersions () {
@@ -103,17 +92,18 @@ function supportedVersions () {
 class LanProxy extends EventEmitter {
   /**
    * @param {object} opts
-   * @param {string} opts.host            remote server host
-   * @param {number} [opts.port=19132]    remote server port
-   * @param {string} [opts.name]          name shown in the Friends/LAN list (default: remote MOTD)
-   * @param {string} [opts.levelName]     world name shown under it (default: remote level name)
+   * @param {string} opts.host            remote server host or http(s):// URL
+   * @param {number} [opts.port=19132]    remote game port (TCP signalling)
+   * @param {string} [opts.name]          name shown in the Friends/LAN list (default: remote's name)
+   * @param {string} [opts.levelName]     world name shown under it (default: remote's level)
    * @param {string} [opts.version]       game version (default: auto-detect from remote)
    * @param {boolean} [opts.offline]      connect to the remote without Xbox sign-in
+   * @param {string} [opts.serverKey]     sha256:<hex> to pin the remote's server key
+   * @param {string} [opts.trustFile]     where first-seen server keys are remembered
    * @param {string} [opts.bind]          local IPv4 for the LAN discovery socket
    * @param {number} [opts.maxPlayers=10] max simultaneous LAN players
    * @param {string} [opts.profilesFolder] where upstream Microsoft sign-in tokens are cached
    * @param {'werift'|'wrtc'|'auto'} [opts.webrtc] WebRTC backend for node-nethernet
-   * @param {'auto'|'raknet-native'|'jsp-raknet'} [opts.raknet='auto'] RakNet backend for the upstream link
    * @param {number} [opts.refreshSeconds=15] how often to re-ping the remote
    * @param {boolean} [opts.logPackets] log every relayed packet
    */
@@ -124,9 +114,11 @@ class LanProxy extends EventEmitter {
       port: 19132,
       maxPlayers: 10,
       profilesFolder: DEFAULT_PROFILES,
+      trustFile: DEFAULT_TRUST_FILE,
       refreshSeconds: 15,
       ...opts
     }
+    this.origin = remoteOrigin(this.opts.host, this.opts.port)
     this.remote = null
     this.remoteUp = false
     this.relay = null
@@ -136,26 +128,29 @@ class LanProxy extends EventEmitter {
   async start () {
     const o = this.opts
 
-    this.raknetBackend = useRaknetBackend(o.raknet)
-    this.emit('debug', `Upstream RakNet backend: ${this.raknetBackend}`)
-
     try {
-      this.remote = await pingRemote(o.host, o.port)
+      this.remote = await pingRemote(this.origin)
       this.remoteUp = true
       this.emit('remote', this.remote)
     } catch (err) {
-      this.emit('warn', `Remote ${o.host}:${o.port} did not answer a ping (${err.message}). Starting anyway.`)
+      this.emit('warn', `Remote ${this.origin} did not answer (${err.cause?.code || err.message}). Starting anyway.`)
     }
 
     const { version, how, warn } = resolveVersion(o.version, this.remote)
     this.version = version
     this.emit(warn ? 'warn' : 'info', `Game version ${version} (${how})`)
 
+    const trust = createServerTrust({
+      file: o.trustFile,
+      pinned: o.serverKey,
+      log: (level, msg) => this.emit(level, msg)
+    })
+
     let relay
     this.relay = relay = new Relay({
       transport: 'nethernet',
       version,
-      host: o.bind, // node-nethernet binds its discovery socket (UDP 7551) here
+      host: o.bind, // node-nethernet binds its LAN discovery socket (UDP 7551) here
       maxPlayers: o.maxPlayers,
       nethernet: o.webrtc ? { webrtcBackend: o.webrtc } : {},
       logging: !!o.logPackets,
@@ -164,10 +159,16 @@ class LanProxy extends EventEmitter {
       offline: !!o.lanOffline,
       profilesFolder: o.profilesFolder,
       destination: {
-        host: o.host,
-        port: o.port,
-        transport: 'raknet',
-        offline: !!o.offline
+        transport: 'nethernet',
+        offline: !!o.offline,
+        nethernet: {
+          signalling: 'http',
+          // bedrock-protocol insists on a remote network ID; with HTTP signalling the URL
+          // identifies the server and this value is unused.
+          networkId: 1n,
+          webrtcBackend: o.webrtc,
+          http: { url: this.origin, ...trust }
+        }
       },
       advertisementFn: () => this._advertisement(relay),
       onMsaCode: (code, player) => this._onMsaCode(code, player)
@@ -175,7 +176,7 @@ class LanProxy extends EventEmitter {
 
     relay.on('connect', player => this._trackPlayer(player))
     relay.on('join', (player) => {
-      this.emit('info', `${playerName(player)} is now connected to ${o.host}:${o.port}`)
+      this.emit('info', `${playerName(player)} is now connected to ${this.origin}`)
     })
     relay.on('error', err => this.emit('error', err))
 
@@ -190,23 +191,22 @@ class LanProxy extends EventEmitter {
     const o = this.opts
     const r = this.remote
     const ad = relay.advertisement // a NethernetServerAdvertisement created by bedrock-protocol
-    ad.motd = o.name || (r && r.motd) || `${o.host}`
-    ad.levelName = o.levelName || (r && r.levelName) || `${o.host}:${o.port}`
-    ad.gamemodeId = r ? r.gamemodeId : 0
+    ad.motd = o.name || r?.motd || o.host
+    ad.levelName = o.levelName || r?.levelName || this.origin.replace(/^https?:\/\//, '')
+    ad.gamemodeId = r?.gamemodeId ?? 0
     // Show the remote's population so people know who's on; fall back to our own count.
-    ad.playerCount = r && this.remoteUp ? r.playersOnline : this.players.size
-    ad.playersMax = r && r.playersMax ? r.playersMax : o.maxPlayers
+    ad.playerCount = r?.playersMax && this.remoteUp ? r.playersOnline : this.players.size
+    ad.playersMax = r?.playersMax || o.maxPlayers
     return ad
   }
 
   async _refreshRemote () {
-    const o = this.opts
     try {
-      this.remote = await pingRemote(o.host, o.port)
-      if (!this.remoteUp) this.emit('info', `Remote ${o.host}:${o.port} is reachable again`)
+      this.remote = await pingRemote(this.origin)
+      if (!this.remoteUp) this.emit('info', `Remote ${this.origin} is reachable again`)
       this.remoteUp = true
-    } catch (err) {
-      if (this.remoteUp) this.emit('warn', `Remote ${o.host}:${o.port} stopped answering pings`)
+    } catch {
+      if (this.remoteUp) this.emit('warn', `Remote ${this.origin} stopped answering`)
       this.remoteUp = false
     }
   }
@@ -242,4 +242,12 @@ function playerName (player) {
   return player?.profile?.name || player?.connection?.address?.toString() || 'A player'
 }
 
-module.exports = { LanProxy, pingRemote, resolveVersion, supportedVersions, useRaknetBackend, DEFAULT_PROFILES }
+module.exports = {
+  LanProxy,
+  pingRemote,
+  remoteOrigin,
+  resolveVersion,
+  supportedVersions,
+  DEFAULT_PROFILES,
+  DEFAULT_TRUST_FILE
+}

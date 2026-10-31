@@ -1,0 +1,7 @@
+{
+  "name": "raknet-node",
+  "version": "0.0.0-nethernet-only",
+  "description": "Empty stand-in. Bedrock 1.26.60+ uses NetherNet only, so bedrock-protocol never loads RakNet here.",
+  "main": "index.js",
+  "license": "MIT"
+}

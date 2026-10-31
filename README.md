@@ -1,11 +1,13 @@
 # bedrock-lan-proxy
 
 Make a remote Minecraft Bedrock server show up under **Friends → LAN Games** on every
-console, phone and PC on your network, using the NetherNet protocol
-([node-nethernet](https://github.com/PrismarineJS/node-nethernet)).
+console, phone and PC on your network. It speaks NetherNet (the WebRTC-based transport
+Bedrock uses since 1.26.60) on both sides, via
+[node-nethernet](https://github.com/PrismarineJS/node-nethernet).
 
 ```
-Bedrock client ──NetherNet / WebRTC (LAN, UDP 7551)──▶ bedrock-lan-proxy ──RakNet──▶ remote server
+Bedrock client ──NetherNet, LAN signalling (UDP 7551)──▶ bedrock-lan-proxy
+bedrock-lan-proxy ──NetherNet, HTTP signalling (TCP game port) + WebRTC (UDP)──▶ remote server
 ```
 
 Handy for consoles that can't add custom servers, or just so nobody has to type an address.
@@ -20,28 +22,32 @@ npm install
 npm link        # optional: puts `bedrock-lan-proxy` on your PATH
 ```
 
+Nothing is compiled during install.
+
 ## Use
 
 ```sh
 bedrock-lan-proxy play.example.net
 bedrock-lan-proxy 203.0.113.7:19133 --name "Glenn's Server"
+bedrock-lan-proxy https://mc.example.net           # server behind HTTPS signalling
 bedrock-lan-proxy mc.example.net --offline          # remote has online-mode=false
 bedrock-lan-proxy mc.example.net -b 192.168.1.20    # pick the LAN interface
 ```
 
-Within a few seconds it appears in the LAN list with the remote's MOTD and player count.
+Within a few seconds it appears in the LAN list with the remote's name and player count.
 Run `bedrock-lan-proxy --help` for all options.
 
 | Option | What it does |
 | --- | --- |
-| `-p, --port` | Remote port (default 19132; `host:port` works too) |
+| `-p, --port` | Remote game port (default 19132; `host:port` works too) |
 | `-n, --name` / `-l, --level` | Override the name / world line shown in the LAN list |
 | `-g, --game-version` | Force a game version (default: match the remote) |
 | `--offline` | Join the remote without Xbox sign-in |
+| `--server-key` | Require this remote server key (`sha256:…`) |
 | `-b, --bind` | Local IPv4 for LAN discovery |
 | `-m, --max-players` | Players through the proxy at once (default 10) |
 | `--profiles` | Where sign-in tokens are cached (default `~/.bedrock-lan-proxy/auth`) |
-| `--webrtc`, `--raknet` | Backend overrides (rarely needed) |
+| `--webrtc` | WebRTC backend override (rarely needed) |
 | `--log-packets`, `--debug` | Troubleshooting output |
 
 ## First join: one-time sign-in
@@ -57,27 +63,42 @@ Microsoft account:
 
 With `--offline` there's no sign-in at all, but the remote must allow unauthenticated players.
 
+## Remote server key
+
+A NetherNet server signs its connection answers with an operator key. Over plain HTTP the
+proxy checks the signature but can't tell on its own whether it's the *right* server, so,
+like SSH, it trusts the key it sees the first time and remembers it in
+`~/.bedrock-lan-proxy/known_servers.json`. If the key ever changes, it refuses to connect
+and prints both keys. If the server was legitimately reinstalled, delete its line from that
+file. To skip first-use trust, pass the key with `--server-key`. HTTPS addresses are
+verified through TLS instead.
+
 ## Good to know
 
 - **Versions must match.** Clients, the proxy and the remote all need the same Bedrock
-  version. The proxy auto-detects the remote's; if Minecraft updates before
-  `bedrock-protocol` does, run `npm update` (and check `--list-versions`).
-- **Firewall:** allow Node.js on private networks. It needs UDP 7551 for discovery plus
-  WebRTC traffic on random UDP ports. On Windows, accept the prompt the first time.
+  version (1.26.60 or newer). The proxy auto-detects the remote's; if Minecraft updates
+  before `bedrock-protocol` does, run `npm update` (and check `--list-versions`).
+- **Firewall:** allow Node.js on private networks. It needs UDP 7551 for LAN discovery
+  plus WebRTC traffic on random UDP ports, and outbound TCP to the remote's game port.
 - **Don't run Minecraft on the proxy machine at the same time.** Both want UDP port 7551.
-- **The remote must speak RakNet** (normal dedicated servers, BDS, Geyser, etc.).
 
 ## How it works
 
-- **node-nethernet** answers LAN discovery broadcasts on UDP 7551, handles WebRTC
-  signalling, and carries game packets over WebRTC data channels.
-- **bedrock-protocol's `Relay`** (built on node-nethernet) terminates each LAN client's
-  session and opens a matching one to the remote. Plain byte forwarding isn't possible:
-  NetherNet sessions have no `0xFE` batch header and no game-layer encryption, while RakNet
-  servers require both.
-- The upstream RakNet link uses `raknet-native` when its prebuilt binary loads, otherwise
-  the pure-JS `jsp-raknet`. The `.npmrc` sets `ignore-scripts=true` so `npm install`
-  doesn't fail trying to compile raknet-native on OS versions it has no binary for.
+- **LAN side:** node-nethernet answers discovery broadcasts on UDP 7551 with an
+  advertisement mirroring the remote's name and player count, then accepts each client's
+  WebRTC connection.
+- **Remote side:** the proxy fetches the remote's metadata with `GET /v1/join` on its game
+  port, then for each player posts a WebRTC offer to `/v1/join/<id>`, signed with that
+  player's identity, and verifies the server's signed answer. This HTTP signalling is
+  newer than the npm release of node-nethernet, so the dependency is pinned to a GitHub
+  commit. `src/upstream.js` plugs it into bedrock-protocol, which otherwise only knows LAN
+  and Xbox-services signalling.
+- **In between:** bedrock-protocol's `Relay` terminates each client's game session and
+  opens a matching one upstream.
+- **No RakNet:** bedrock-protocol still lists native RakNet modules as dependencies.
+  `package.json` overrides them with empty stubs (`stubs/`), so nothing gets compiled.
+  `npm ls` reports the stubs as "invalid" because they deliberately don't match
+  bedrock-protocol's version range; that's expected.
 
 ## Test
 
@@ -85,8 +106,9 @@ With `--offline` there's no sign-in at all, but the remote must allow unauthenti
 npm test
 ```
 
-Spins up a fake RakNet server, the proxy and a NetherNet client on this machine, then
-checks LAN discovery, the advertised name, login, and packets relayed both ways.
+Spins up a fake NetherNet remote (HTTP signalling + WebRTC), the proxy and a NetherNet
+client on this machine, then checks LAN discovery, the advertised name, login, packets
+relayed both ways, the signed identity on the upstream offer, and server-key trust.
 
 ## Use as a library
 

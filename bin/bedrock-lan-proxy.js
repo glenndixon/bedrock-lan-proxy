@@ -11,27 +11,31 @@ if (major < 24) {
   process.exit(1)
 }
 
-const { LanProxy, supportedVersions, DEFAULT_PROFILES } = require('../src/proxy')
+const { LanProxy, supportedVersions, DEFAULT_PROFILES, DEFAULT_TRUST_FILE } = require('../src/proxy')
 
 const HELP = `
 bedrock-lan-proxy ${pkg.version}
 Make a remote Minecraft Bedrock server appear in the Friends tab as a LAN game.
+Speaks NetherNet to both your LAN clients and the remote (Bedrock 1.26.60+).
 
 Usage:
   bedrock-lan-proxy <host>[:port] [options]
+  bedrock-lan-proxy https://host[:port] [options]
 
 Options:
-  -p, --port <n>           Remote server port (default 19132)
-  -n, --name <text>        Name shown in the LAN list (default: the remote's MOTD)
+  -p, --port <n>           Remote game port (default 19132)
+  -n, --name <text>        Name shown in the LAN list (default: the remote's name)
   -l, --level <text>       World name shown under it (default: the remote's level name)
-  -g, --game-version <v>   Game version to speak, e.g. 1.21.90 (default: match the remote)
+  -g, --game-version <v>   Game version to speak, e.g. 1.26.60 (default: match the remote)
       --offline            Join the remote without Xbox sign-in (remote must have online-mode off)
+      --server-key <key>   Require this remote server key (sha256:...). Without it, the key
+                           seen on first connect is remembered in
+                           ${DEFAULT_TRUST_FILE}
   -b, --bind <ip>          Local IPv4 address for LAN discovery (default: all interfaces)
   -m, --max-players <n>    Max players through the proxy at once (default 10)
       --profiles <dir>     Where upstream sign-in tokens are cached
                            (default ${DEFAULT_PROFILES})
       --webrtc <backend>   werift (default), wrtc, or auto
-      --raknet <backend>   Upstream RakNet: auto (default), raknet-native, or jsp-raknet
       --debug              Show extra diagnostic messages
       --log-packets        Print every relayed packet (very noisy)
       --list-versions      Print supported game versions and exit
@@ -63,7 +67,7 @@ try {
       'max-players': { type: 'string', short: 'm' },
       profiles: { type: 'string' },
       webrtc: { type: 'string' },
-      raknet: { type: 'string' },
+      'server-key': { type: 'string' },
       debug: { type: 'boolean' },
       'log-packets': { type: 'boolean' },
       'list-versions': { type: 'boolean' },
@@ -83,19 +87,24 @@ if (v['list-versions']) { console.log(supportedVersions().join('\n')); process.e
 
 if (positionals.length !== 1) fail('give exactly one remote server, like play.example.net or 1.2.3.4:19132')
 
-// Accept host, host:port, or [ipv6]:port
+// Accept host, host:port, [ipv6]:port, or an http(s):// URL
 let host = positionals[0]
 let port = 19132
-const m = host.match(/^\[(.+)\](?::(\d+))?$/) || host.match(/^([^:]+)(?::(\d+))?$/)
-if (m) { host = m[1]; if (m[2]) port = Number(m[2]) }
-if (v.port) port = Number(v.port)
-if (!Number.isInteger(port) || port < 1 || port > 65535) fail(`invalid port ${v.port ?? port}`)
+if (/^https?:\/\//i.test(host)) {
+  try { host = new URL(host).origin } catch { fail(`invalid URL ${host}`) }
+  if (v.port) fail('put the port in the URL instead of using --port')
+} else {
+  const m = host.match(/^\[(.+)\](?::(\d+))?$/) || host.match(/^([^:]+)(?::(\d+))?$/)
+  if (m) { host = m[1]; if (m[2]) port = Number(m[2]) }
+  if (v.port) port = Number(v.port)
+  if (!Number.isInteger(port) || port < 1 || port > 65535) fail(`invalid port ${v.port ?? port}`)
+}
 
 const maxPlayers = v['max-players'] ? Number(v['max-players']) : undefined
 if (maxPlayers !== undefined && (!Number.isInteger(maxPlayers) || maxPlayers < 1)) fail('--max-players must be a positive whole number')
 
 if (v.webrtc && !['werift', 'wrtc', 'auto'].includes(v.webrtc)) fail('--webrtc must be werift, wrtc or auto')
-if (v.raknet && !['auto', 'raknet-native', 'jsp-raknet'].includes(v.raknet)) fail('--raknet must be auto, raknet-native or jsp-raknet')
+if (v['server-key'] && !/^sha256:[0-9a-f]{64}$/.test(v['server-key'])) fail('--server-key must look like sha256:<64 lowercase hex digits>')
 
 const stamp = () => new Date().toLocaleTimeString()
 const log = (...a) => console.log(`[${stamp()}]`, ...a)
@@ -111,14 +120,16 @@ const proxy = new LanProxy({
   maxPlayers,
   profilesFolder: v.profiles,
   webrtc: v.webrtc,
-  raknet: v.raknet,
+  serverKey: v['server-key'],
   logPackets: v['log-packets']
 })
 
 proxy.on('info', msg => log(msg))
 proxy.on('warn', msg => log('warning:', msg))
 if (v.debug) proxy.on('debug', msg => log('debug:', msg))
-proxy.on('remote', r => log(`Remote ${host}:${port} → "${r.motd}" v${r.version}, ${r.playersOnline}/${r.playersMax} online`))
+proxy.on('remote', r => log(r.motd
+  ? `Remote ${proxy.origin} → "${r.motd}" v${r.version ?? '?'}, ${r.playersOnline}/${r.playersMax} online`
+  : `Remote ${proxy.origin} is reachable but publishes no name or version`))
 proxy.on('auth', ({ player, url, code }) => {
   log(`${player} needs a one-time Microsoft sign-in for the remote server:`)
   log(`    open ${url} and enter ${code}`)
