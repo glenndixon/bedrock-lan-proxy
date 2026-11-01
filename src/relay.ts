@@ -1,5 +1,3 @@
-'use strict'
-
 // bedrock-protocol's Relay, with the upstream connection tied to the LAN player's lifetime.
 //
 // The stock Relay starts a player's upstream connection when they join and only links
@@ -13,24 +11,43 @@
 // forwards packets as their original bytes (including split-screen players'), and keeps
 // batches within NetherNet's message size limit.
 
-const { Relay, Client } = require('bedrock-protocol')
-const debug = require('debug')('minecraft-protocol')
+import { Relay, Client } from 'bedrock-protocol'
+import createDebug from 'debug'
+import minecraftData from 'minecraft-data'
+import { Connection as BedrockConnection } from 'bedrock-protocol/src/connection.js'
+import { Framer } from 'bedrock-protocol/src/transforms/framer.js'
+import { Connection as NethernetConnection } from 'nethernet/src/connection.js'
+import type {
+  ConnectionInternals, DisconnectParams, MsaCode, ParsedPacket, RelayInternals,
+  RelayPlayerInternals, UpstreamClient, UpstreamNethernetOptions
+} from './types/internals.ts'
 
-const { Connection: BedrockConnection } = require('bedrock-protocol/src/connection')
-const { Framer } = require('bedrock-protocol/src/transforms/framer')
-const { Connection: NethernetConnection } = require('nethernet/src/connection')
+const debug = createDebug('minecraft-protocol')
+
+// ---------------------------------------------------------------------------------------
+// Packet headers
+
+interface PacketHeader {
+  /** Packet ID (bits 0-9 of the header varint). */
+  id: number
+  /** Split-screen player number, or 0 for the main player. */
+  sub: number
+  /** Length of the header varint in bytes. */
+  length: number
+}
 
 // Packet header: a varint holding the packet ID (bits 0-9) and, for split-screen players,
 // which "sub-client" it's from or for (bits 10-13). Sub-clients share the first player's
 // connection. bedrock-protocol doesn't understand those bits, so it mangles such packets.
-function readHeader (packet) {
+export function readHeader (packet: Buffer): PacketHeader {
   let value = 0
   let shift = 0
   let length = 0
   for (let i = 0; i < packet.length && i < 5; i++) {
-    value |= (packet[i] & 0x7f) << shift
+    const byte = packet[i]!
+    value |= (byte & 0x7f) << shift
     length = i + 1
-    if (!(packet[i] & 0x80)) break
+    if (!(byte & 0x80)) break
     shift += 7
   }
   // Two 2-bit fields: sender sub-client (bits 10-11) and target sub-client (bits 12-13).
@@ -40,40 +57,51 @@ function readHeader (packet) {
   return { id: value & 0x3ff, sub: sender || target, length }
 }
 
-function writeVarint (n) {
-  const out = []
+export function writeVarint (n: number): Buffer {
+  const out: number[] = []
   while (n > 0x7f) { out.push((n & 0x7f) | 0x80); n >>>= 7 }
   out.push(n)
   return Buffer.from(out)
 }
+
+interface Inspected extends PacketHeader {
+  des?: ParsedPacket
+  error?: Error
+}
+
+// ---------------------------------------------------------------------------------------
+// Raw relaying
+
+// TypeScript mixins require a constructor with a single any[] rest parameter.
+type RelayPlayerConstructor = new (...args: any[]) => RelayPlayerInternals
 
 // Every packet is forwarded as the exact bytes received. Decoding and re-encoding them
 // (what the stock Relay does) risks small differences the game rejects, and can't handle
 // sub-client packets at all. NetherNet has no game-layer encryption, so raw bytes are
 // valid on the other side. Packets are still decoded for logging and for the few the
 // proxy has to act on.
-function withRawRelay (Base, packetNames) {
-  const nameOf = (id) => packetNames[id] || `packet_${id}`
+function withRawRelay<TBase extends RelayPlayerConstructor> (Base: TBase, packetNames: Record<string, string>) {
+  const nameOf = (id: number): string => packetNames[id] ?? `packet_${id}`
 
   return class RawRelayPlayer extends Base {
     // Decode a packet for inspection; for sub-client packets, strip the sub-client bits
     // first so bedrock-protocol can read the body.
-    inspect (packet) {
+    inspect (packet: Buffer): Inspected {
       const header = readHeader(packet)
       try {
         const buf = header.sub ? Buffer.concat([writeVarint(header.id), packet.subarray(header.length)]) : packet
         return { ...header, des: this.server.deserializer.parsePacketBuffer(buf) }
       } catch (err) {
-        return { ...header, error: err }
+        return { ...header, error: err as Error }
       }
     }
 
-    describe ({ id, sub }) {
+    describe ({ id, sub }: PacketHeader): string {
       return sub ? `${nameOf(id)} (split-screen player ${sub})` : nameOf(id)
     }
 
     // Console → proxy → remote
-    readPacket (packet) {
+    override readPacket (packet: Buffer): void {
       if (!this.startRelaying) return super.readPacket(packet) // our own login handshake
       if (!this.upstream) {
         this.upQ.push(packet)
@@ -83,36 +111,41 @@ function withRawRelay (Base, packetNames) {
       this.relayUp(packet)
     }
 
-    relayUp (packet) {
+    relayUp (packet: Buffer): void {
+      const upstream = this.upstream
+      if (!upstream) {
+        this.upQ.push(packet)
+        return
+      }
       const info = this.inspect(packet)
       const name = info.des?.data.name
       if (info.sub) {
         this.downInLog(`${this.describe(info)}, ${packet.length} bytes`)
         if (name === 'sub_client_login') this.server.emit('subClientLogin', this, info.sub)
-      } else if (info.error) {
-        this.downInLog(`${this.describe(info)} (could not decode: ${info.error.message}), relaying raw`)
+      } else if (!info.des) {
+        this.downInLog(`${this.describe(info)} (could not decode: ${info.error?.message}), relaying raw`)
       } else {
         this.downInLog('recv', name, info.des.data.params)
         this.emit('serverbound', info.des.data, info.des)
         if (info.des.canceled) return
         if (name === 'client_cache_status') {
           // The relay can't serve cached chunks, so keep the cache off upstream.
-          this.upstream.queue('client_cache_status', { enabled: !!this.server.enableChunkCaching })
+          upstream.queue('client_cache_status', { enabled: !!this.server.enableChunkCaching })
           return
         }
         if (name === 'set_local_player_as_initialized') this.status = 3
       }
-      this.upstream.sendBuffer(packet)
+      upstream.sendBuffer(packet)
     }
 
-    flushUpQueue () {
+    override flushUpQueue (): void {
       const queued = this.upQ
       this.upQ = []
       for (const packet of queued) this.relayUp(packet)
     }
 
     // Remote → proxy → console
-    readUpstream (packet) {
+    override readUpstream (packet: Buffer): void {
       if (!this.startRelaying) {
         this.downQ.push(packet)
         return
@@ -123,13 +156,13 @@ function withRawRelay (Base, packetNames) {
 
       if (info.sub) {
         this.upInLog(`-> ${this.describe(info)}, ${packet.length} bytes`)
-        if (name === 'disconnect') this.server.emit('subClientKick', this, info.sub, params)
-        if (name === 'play_status') this.server.emit('subClientStatus', this, info.sub, params.status)
+        if (name === 'disconnect') this.server.emit('subClientKick', this, info.sub, params as DisconnectParams)
+        if (name === 'play_status') this.server.emit('subClientStatus', this, info.sub, params?.status)
         this.sendBuffer(packet)
         return
       }
-      if (info.error) {
-        this.upInLog(`-> ${this.describe(info)} (could not decode: ${info.error.message}), relaying raw`)
+      if (!info.des || !name || !params) {
+        this.upInLog(`-> ${this.describe(info)} (could not decode: ${info.error?.message}), relaying raw`)
         this.sendBuffer(packet)
         return
       }
@@ -155,7 +188,7 @@ function withRawRelay (Base, packetNames) {
       }
     }
 
-    flushDownQueue () {
+    override flushDownQueue (): void {
       const queued = this.downQ
       this.downQ = []
       for (const packet of queued) this.readUpstream(packet)
@@ -163,19 +196,24 @@ function withRawRelay (Base, packetNames) {
   }
 }
 
+// ---------------------------------------------------------------------------------------
+// NetherNet message size
+
 // NetherNet sends each message as up to 256 segments of 10,000 bytes, with the count in a
 // single byte. bedrock-protocol bundles everything queued in a 20 ms tick into one batch,
 // and a burst (like a split-screen player's whole world setup, ~3.5 MB) can exceed that,
 // silently wrapping the count and corrupting the stream. Cap batches well below the limit.
-const MAX_BATCH_BYTES = 1_000_000
-BedrockConnection.prototype._tick = function () {
+export const MAX_BATCH_BYTES = 1_000_000
+const NETHERNET_MAX_MESSAGE = 256 * 10_000
+
+BedrockConnection.prototype._tick = function (this: ConnectionInternals): void {
   if (!this.sendQ.length) return
   const queued = this.sendQ
   this.sendQ = []
   this.sendIds = []
-  let chunk = []
+  let chunk: Buffer[] = []
   let size = 0
-  const flush = () => {
+  const flush = (): void => {
     if (!chunk.length) return
     const batch = new Framer(this)
     batch.addEncodedPackets(chunk)
@@ -194,60 +232,117 @@ BedrockConnection.prototype._tick = function () {
 
 // And refuse, loudly, to send a message that still wouldn't fit, instead of corrupting it.
 const sendNow = NethernetConnection.prototype.sendNow
-NethernetConnection.prototype.sendNow = function (data) {
-  if (data.length > 256 * 10_000) throw new Error(`NetherNet message too large (${data.length} bytes)`)
+NethernetConnection.prototype.sendNow = function (this: NethernetConnection, data: Buffer): number {
+  if (data.length > NETHERNET_MAX_MESSAGE) throw new Error(`NetherNet message too large (${data.length} bytes)`)
   return sendNow.call(this, data)
 }
 
-class ProxyRelay extends Relay {
-  constructor (options) {
-    super(options)
-    const mcData = require('minecraft-data')('bedrock_' + this.options.version)
-    const names = mcData.protocol.types.mcpe_packet[1][0].type[1].mappings
-    this.RelayPlayer = withRawRelay(this.RelayPlayer, names)
+// ---------------------------------------------------------------------------------------
+// The relay
+
+/** Events ProxyRelay emits, beyond bedrock-protocol's 'connect'. */
+export interface ProxyRelayEvents {
+  connect: [player: RelayPlayerInternals]
+  join: [player: RelayPlayerInternals, upstream: UpstreamClient]
+  upstreamKick: [player: RelayPlayerInternals, packet: DisconnectParams]
+  upstreamCancelled: [player: RelayPlayerInternals, upstream: UpstreamClient]
+  subClientLogin: [player: RelayPlayerInternals, sub: number]
+  subClientStatus: [player: RelayPlayerInternals, sub: number, status: unknown]
+  subClientKick: [player: RelayPlayerInternals, sub: number, packet: DisconnectParams | undefined]
+  error: [error: Error]
+}
+
+/** What LanProxy passes to the relay (a superset of bedrock-protocol's RelayOptions). */
+export interface ProxyRelayOptions {
+  transport: 'nethernet'
+  version: string
+  host?: string
+  maxPlayers?: number
+  nethernet: { webrtcBackend?: 'werift' | 'wrtc' | 'auto' }
+  logging: boolean
+  offline: boolean
+  profilesFolder?: string
+  destination: {
+    transport: 'nethernet'
+    offline: boolean
+    nethernet: UpstreamNethernetOptions
+  }
+  advertisementFn: () => RelayInternals['advertisement']
+  onMsaCode: (code: MsaCode, player: RelayPlayerInternals) => void
+}
+
+/** Upstream Client options (bedrock-protocol's ClientOptions plus the fields it reads internally). */
+interface UpstreamClientOptions {
+  authTitle?: string
+  flow?: string
+  deviceType?: string
+  offline?: boolean
+  username?: string
+  version: string
+  host?: string
+  port?: number
+  transport?: 'raknet' | 'nethernet'
+  nethernet?: UpstreamNethernetOptions
+  batchingInterval?: number
+  onMsaCode: (code: MsaCode) => void
+  profilesFolder?: string | false
+  autoInitPlayer: boolean
+}
+
+export class ProxyRelay extends Relay {
+  constructor (options: ProxyRelayOptions) {
+    super(options as unknown as ConstructorParameters<typeof Relay>[0])
+    const self = this as unknown as RelayInternals
+    const protocol = minecraftData('bedrock_' + self.options.version).protocol as {
+      types: { mcpe_packet: [string, [{ type: [string, { mappings: Record<string, string> }] }]] }
+    }
+    const names = protocol.types.mcpe_packet[1][0].type[1].mappings
+    self.RelayPlayer = withRawRelay(self.RelayPlayer, names)
   }
 
-  async openUpstreamConnection (ds, clientAddr) {
+  async openUpstreamConnection (ds: RelayPlayerInternals, clientAddr: bigint): Promise<void> {
+    const self = this as unknown as RelayInternals
     const key = String(clientAddr)
-    const options = {
-      authTitle: this.options.authTitle,
-      flow: this.options.flow,
-      deviceType: this.options.deviceType,
-      offline: this.options.destination.offline ?? this.options.offline,
-      username: this.options.offline ? ds.profile.name : ds.profile.xuid,
-      version: this.options.version,
-      host: this.options.destination.host,
-      port: this.options.destination.port,
-      transport: this.options.destination.transport,
-      nethernet: this.options.destination.nethernet,
-      batchingInterval: this.options.batchingInterval,
+    const o = self.options
+    const options: UpstreamClientOptions = {
+      authTitle: o.authTitle,
+      flow: o.flow,
+      deviceType: o.deviceType,
+      offline: o.destination.offline ?? o.offline,
+      username: o.offline ? ds.profile?.name : ds.profile?.xuid,
+      version: o.version,
+      host: o.destination.host,
+      port: o.destination.port,
+      transport: o.destination.transport,
+      nethernet: o.destination.nethernet,
+      batchingInterval: o.batchingInterval,
       onMsaCode: (code) => {
-        if (this.options.onMsaCode) this.options.onMsaCode(code, ds)
+        if (o.onMsaCode) o.onMsaCode(code, ds)
         else ds.disconnect('Sign in at ' + code.verification_uri + ' with code ' + code.user_code)
       },
-      profilesFolder: this.options.profilesFolder,
+      profilesFolder: o.profilesFolder,
       autoInitPlayer: false
     }
 
     // If the player is already gone (left during the join handshake), don't start.
     if (ds._closed) return
 
-    const client = new Client(options)
+    const client = new Client(options as unknown as ConstructorParameters<typeof Client>[0]) as unknown as UpstreamClient
     if (!client.noLoginForward) client.options.skinData = ds.skinData
     client.outLog = ds.upOutLog
     client.inLog = ds.upInLog
 
-    let kick = null
+    let kick: DisconnectParams | null = null
     let finished = false
-    const finish = () => {
+    const finish = (): void => {
       finished = true
       ds.off('close', onPlayerClose)
-      if (this.upstreams.get(key) === client) this.upstreams.delete(key)
+      if (self.upstreams.get(key) === client) self.upstreams.delete(key)
     }
 
     // Player left before (or after) the remote accepted them: cancel the upstream.
     // Microsoft sign-in still completes and caches its token if it's in progress.
-    const onPlayerClose = () => {
+    const onPlayerClose = (): void => {
       if (finished) return
       finish()
       this.emit('upstreamCancelled', ds, client)
@@ -255,22 +350,22 @@ class ProxyRelay extends Relay {
     }
     ds.once('close', onPlayerClose)
 
-    client.on('kick', (packet) => {
+    client.on('kick', (packet: DisconnectParams) => {
       kick = packet
       this.emit('upstreamKick', ds, packet)
     })
 
     client.once('join', () => {
       if (finished) return client.close()
-      client.write('client_cache_status', { enabled: this.enableChunkCaching })
+      client.write('client_cache_status', { enabled: self.enableChunkCaching })
       ds.upstream = client
       ds.flushUpQueue()
-      this.conLog('Connected to upstream server')
-      client.readPacket = (packet) => ds.readUpstream(packet)
+      self.conLog('Connected to upstream server')
+      client.readPacket = (packet: Buffer) => ds.readUpstream(packet)
       this.emit('join', ds, client)
     })
 
-    client.on('error', (err) => {
+    client.on('error', (err: Error) => {
       if (finished) return
       finish()
       debug(clientAddr, 'was disconnected because of error', err)
@@ -285,15 +380,19 @@ class ProxyRelay extends Relay {
       ds.disconnect(kick?.message || 'The server closed the connection')
     })
 
-    this.upstreams.set(key, client)
+    self.upstreams.set(key, client)
     client.connect()
   }
 
-  closeUpstreamConnection (clientAddr) {
+  /** Typed view of this relay's events. */
+  get events (): import('node:events').EventEmitter<ProxyRelayEvents> {
+    return this as unknown as import('node:events').EventEmitter<ProxyRelayEvents>
+  }
+
+  closeUpstreamConnection (clientAddr: bigint): void {
+    const self = this as unknown as RelayInternals
     const key = String(clientAddr)
-    this.upstreams.get(key)?.close()
-    this.upstreams.delete(key)
+    self.upstreams.get(key)?.close()
+    self.upstreams.delete(key)
   }
 }
-
-module.exports = { ProxyRelay }

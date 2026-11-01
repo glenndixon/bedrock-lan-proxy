@@ -1,5 +1,3 @@
-'use strict'
-
 // Trust for the remote server's operator key.
 //
 // Over plain HTTP, node-nethernet verifies that the server's answer is signed by *some*
@@ -7,31 +5,40 @@
 // see it for a given address, remember it, and refuse if it later changes. A key given
 // with --server-key is pinned instead. HTTPS origins are trusted through TLS.
 
-const fs = require('node:fs')
-const path = require('node:path')
+import fs from 'node:fs'
+import path from 'node:path'
 
-function readStore (file) {
+/** origin → sha256:<hex> fingerprint */
+type KeyStore = Record<string, string>
+
+export type TrustLog = (level: 'info' | 'warn', message: string) => void
+
+export interface ServerTrust {
+  serverKey?: string
+  onServerKey?: (fingerprint: string, origin: string) => boolean
+}
+
+function readStore (file: string): KeyStore {
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'))
+    return JSON.parse(fs.readFileSync(file, 'utf8')) as KeyStore
   } catch (err) {
-    if (err.code === 'ENOENT') return {}
-    throw new Error(`Could not read ${file}: ${err.message}`)
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return {}
+    throw new Error(`Could not read ${file}: ${(err as Error).message}`)
   }
 }
 
-function writeStore (file, store) {
+function writeStore (file: string, store: KeyStore): void {
   fs.mkdirSync(path.dirname(file), { recursive: true })
   fs.writeFileSync(file, JSON.stringify(store, null, 2) + '\n')
 }
 
-/**
- * @param {object} opts
- * @param {string} opts.file           where remembered keys live
- * @param {string} [opts.pinned]       sha256:<hex> key to require
- * @param {(level: 'info'|'warn', msg: string) => void} [opts.log]
- * @returns {{ serverKey?: string, onServerKey?: (fingerprint: string, origin: string) => boolean }}
- */
-function createServerTrust ({ file, pinned, log = () => {} }) {
+export function createServerTrust ({ file, pinned, log = () => {} }: {
+  /** where remembered keys live */
+  file: string
+  /** sha256:<hex> key to require */
+  pinned?: string
+  log?: TrustLog
+}): ServerTrust {
   if (pinned) return { serverKey: pinned }
 
   return {
@@ -55,5 +62,3 @@ function createServerTrust ({ file, pinned, log = () => {} }) {
     }
   }
 }
-
-module.exports = { createServerTrust }

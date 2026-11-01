@@ -18,11 +18,13 @@ Needs **Node.js 24+** (node-nethernet requires it).
 
 ```sh
 cd bedrock-lan-proxy
-npm install
+npm install     # also builds the TypeScript into dist/
 npm link        # optional: puts `bedrock-lan-proxy` on your PATH
 ```
 
-Nothing is compiled during install.
+Without `npm link`, run it with `npm start -- <server> [options]`, or straight from the
+TypeScript source with `node bin/bedrock-lan-proxy.ts <server> [options]` (Node strips the
+types itself, so no build is needed for that).
 
 ## Use
 
@@ -104,17 +106,17 @@ step that appears is where the join stalled.
   port, then for each player posts a WebRTC offer to `/v1/join/<id>`, signed with that
   player's identity, and verifies the server's signed answer. This HTTP signalling is
   newer than the npm release of node-nethernet, so the dependency is pinned to a GitHub
-  commit. `src/upstream.js` plugs it into bedrock-protocol, which otherwise only knows LAN
+  commit. `src/upstream.ts` plugs it into bedrock-protocol, which otherwise only knows LAN
   and Xbox-services signalling.
-- **Real-client fixes** (`src/lanFixes.js`): the proxy sends its WebRTC answer before
+- **Real-client fixes** (`src/lanFixes.ts`): the proxy sends its WebRTC answer before
   its ICE candidates, because the game can't apply a candidate it receives first, and
   includes a random `nonce` in its advertisement like dedicated servers do.
-- **Upstream lifetime** (`src/relay.js`): if a player leaves before their upstream
+- **Upstream lifetime** (`src/relay.ts`): if a player leaves before their upstream
   connection is ready (for example after being kicked to sign in), it's cancelled rather
   than left to log in to the remote on its own. Otherwise their next attempt would be a
   second login for an account that's already online. Kicks from the remote are passed to
   the player with the server's own reason.
-- **Raw forwarding** (`src/relay.js`): after login, packets cross the proxy as the exact
+- **Raw forwarding** (`src/relay.ts`): after login, packets cross the proxy as the exact
   bytes received, in both directions. NetherNet has no game-layer encryption, so this is
   valid, and it avoids any differences from decoding and re-encoding. It's also what makes
   split-screen work: extra local players are sub-clients sharing the first player's
@@ -130,22 +132,57 @@ step that appears is where the join stalled.
   `npm ls` reports the stubs as "invalid" because they deliberately don't match
   bedrock-protocol's version range; that's expected.
 
+## Development
+
+The project is TypeScript (strict), as ES modules:
+
+| Path | What's there |
+| --- | --- |
+| `bin/bedrock-lan-proxy.ts` | The command-line tool |
+| `src/proxy.ts` | `LanProxy`: discovery, version matching, events |
+| `src/relay.ts` | The relay: raw forwarding, split-screen, upstream lifetime, batch cap |
+| `src/upstream.ts` | NetherNet HTTP signalling to the remote |
+| `src/lanFixes.ts` | Fixes for real consoles on the LAN side |
+| `src/trust.ts` | Remembering and checking the remote's server key |
+| `src/diagnostics.ts` | The `--debug` trace |
+| `src/types/` | Types for the bedrock-protocol and node-nethernet internals the proxy uses |
+| `test/` | End-to-end test and the fake remote server it runs against |
+
+```sh
+npm run typecheck   # tsc --noEmit
+npm run build       # compile to dist/ (also runs on npm install)
+npm test            # type-check, then run the end-to-end test from source
+```
+
+Imports use `.ts` paths so Node can run the source directly. The build rewrites them to
+`.js`, and `tsconfig.json` limits the code to syntax Node can strip
+(`erasableSyntaxOnly`).
+
+The proxy patches and reads a few bedrock-protocol and node-nethernet internals that
+aren't in their published typings. `src/types/internals.ts` and `src/types/vendor.d.ts`
+describe exactly those, so they're type-checked too. If a library update changes one,
+`npm run typecheck` is the first place it should show up.
+
 ## Test
 
 ```sh
 npm test
 ```
 
-Spins up a fake NetherNet remote (HTTP signalling + WebRTC), the proxy and a NetherNet
-client on this machine, then checks LAN discovery, the advertised name, login, packets
-relayed both ways, the signed identity on the upstream offer, and server-key trust.
+Spins up a fake NetherNet remote (HTTP signalling + WebRTC), the proxy and NetherNet
+clients on this machine, then checks LAN discovery, the advertised name, login, packets
+relayed both ways, cancelled upstream connections, split-screen packets (including a
+3.5 MB burst), kick reasons, the signed identity on the upstream offer, and server-key trust.
 
 ## Use as a library
 
-```js
-const { LanProxy } = require('bedrock-lan-proxy')
+```ts
+import { LanProxy } from 'bedrock-lan-proxy'
+
 const proxy = new LanProxy({ host: 'play.example.net', name: 'Our Server' })
 proxy.on('info', console.log)
 proxy.on('auth', ({ player, url, code }) => console.log(player, url, code))
 await proxy.start()
 ```
+
+Events and options are fully typed (`LanProxyOptions`, `LanProxyEvents`).
