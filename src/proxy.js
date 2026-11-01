@@ -186,6 +186,15 @@ class LanProxy extends EventEmitter {
     relay.on('upstreamKick', (player, packet) => {
       this.emit('warn', `${this.origin} disconnected ${playerName(player)}: ${packet.message || '(no reason given)'}`)
     })
+    relay.on('subClientLogin', (player, sub) => {
+      this.emit('info', `Split-screen player ${sub} is joining alongside ${playerName(player)}`)
+    })
+    relay.on('subClientStatus', (player, sub, status) => {
+      this.emit('debug', `Split-screen player ${sub} (with ${playerName(player)}): ${status}`)
+    })
+    relay.on('subClientKick', (player, sub, packet) => {
+      this.emit('warn', `${this.origin} disconnected split-screen player ${sub} (with ${playerName(player)}): ${packet?.message || '(no reason given)'}`)
+    })
     relay.on('upstreamCancelled', (player) => {
       this.emit('debug', `${playerName(player)} left before reaching ${this.origin}; cancelled their upstream connection`)
     })

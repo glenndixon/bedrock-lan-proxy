@@ -114,10 +114,15 @@ step that appears is where the join stalled.
   than left to log in to the remote on its own. Otherwise their next attempt would be a
   second login for an account that's already online. Kicks from the remote are passed to
   the player with the server's own reason.
-- **Split-screen** (`src/relay.js`): extra local players on a console are sub-clients
-  sharing the first player's connection. bedrock-protocol can't decode their packets, so
-  the proxy forwards them byte for byte (NetherNet has no game-layer encryption, so this
-  is safe). Each split-screen player signs in to the remote with their own account.
+- **Raw forwarding** (`src/relay.js`): after login, packets cross the proxy as the exact
+  bytes received, in both directions. NetherNet has no game-layer encryption, so this is
+  valid, and it avoids any differences from decoding and re-encoding. It's also what makes
+  split-screen work: extra local players are sub-clients sharing the first player's
+  connection, and bedrock-protocol can't decode their packets. Each split-screen player
+  signs in to the remote with their own account.
+- **Batch size cap:** a NetherNet message holds at most ~2.5 MB (256 segments of 10 KB,
+  counted in one byte). The proxy splits what it sends into batches of at most 1 MB so a
+  burst, like a split-screen player's world setup, can't overflow it and corrupt the stream.
 - **In between:** bedrock-protocol's `Relay` terminates each client's game session and
   opens a matching one upstream.
 - **No RakNet:** bedrock-protocol still lists native RakNet modules as dependencies.

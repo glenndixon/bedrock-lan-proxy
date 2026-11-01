@@ -10,85 +10,201 @@
 //
 // This version cancels the upstream connection when the player leaves, passes the
 // remote server's own disconnect reason through to the player instead of a generic one,
-// and relays split-screen (sub-client) packets untouched.
+// forwards packets as their original bytes (including split-screen players'), and keeps
+// batches within NetherNet's message size limit.
 
 const { Relay, Client } = require('bedrock-protocol')
 const debug = require('debug')('minecraft-protocol')
 
-// Split-screen players are "sub-clients": they share the first player's connection, and
-// each packet header carries which sub-client it's from or for (bits 10-13 of the packet
-// ID varint). bedrock-protocol doesn't decode those bits, so it would mangle the packet
-// (e.g. send the server a player_skin with no body, which gets the whole connection
-// dropped). NetherNet has no game-layer encryption, so pass these packets through
-// byte for byte instead; the server sees exactly what the console sent.
-function subClientBits (packet) {
+const { Connection: BedrockConnection } = require('bedrock-protocol/src/connection')
+const { Framer } = require('bedrock-protocol/src/transforms/framer')
+const { Connection: NethernetConnection } = require('nethernet/src/connection')
+
+// Packet header: a varint holding the packet ID (bits 0-9) and, for split-screen players,
+// which "sub-client" it's from or for (bits 10-13). Sub-clients share the first player's
+// connection. bedrock-protocol doesn't understand those bits, so it mangles such packets.
+function readHeader (packet) {
   let value = 0
   let shift = 0
+  let length = 0
   for (let i = 0; i < packet.length && i < 5; i++) {
     value |= (packet[i] & 0x7f) << shift
+    length = i + 1
     if (!(packet[i] & 0x80)) break
     shift += 7
   }
-  return (value >> 10) & 0xf
+  // Two 2-bit fields: sender sub-client (bits 10-11) and target sub-client (bits 12-13).
+  // Either being set means the packet belongs to a split-screen player.
+  const sender = (value >> 10) & 0x3
+  const target = (value >> 12) & 0x3
+  return { id: value & 0x3ff, sub: sender || target, length }
 }
 
-function withSubClientPassthrough (Base) {
-  return class SubClientRelayPlayer extends Base {
+function writeVarint (n) {
+  const out = []
+  while (n > 0x7f) { out.push((n & 0x7f) | 0x80); n >>>= 7 }
+  out.push(n)
+  return Buffer.from(out)
+}
+
+// Every packet is forwarded as the exact bytes received. Decoding and re-encoding them
+// (what the stock Relay does) risks small differences the game rejects, and can't handle
+// sub-client packets at all. NetherNet has no game-layer encryption, so raw bytes are
+// valid on the other side. Packets are still decoded for logging and for the few the
+// proxy has to act on.
+function withRawRelay (Base, packetNames) {
+  const nameOf = (id) => packetNames[id] || `packet_${id}`
+
+  return class RawRelayPlayer extends Base {
+    // Decode a packet for inspection; for sub-client packets, strip the sub-client bits
+    // first so bedrock-protocol can read the body.
+    inspect (packet) {
+      const header = readHeader(packet)
+      try {
+        const buf = header.sub ? Buffer.concat([writeVarint(header.id), packet.subarray(header.length)]) : packet
+        return { ...header, des: this.server.deserializer.parsePacketBuffer(buf) }
+      } catch (err) {
+        return { ...header, error: err }
+      }
+    }
+
+    describe ({ id, sub }) {
+      return sub ? `${nameOf(id)} (split-screen player ${sub})` : nameOf(id)
+    }
+
     // Console → proxy → remote
     readPacket (packet) {
-      if (this.startRelaying && subClientBits(packet)) {
-        this.downInLog('Relaying sub-client packet raw', packet.length, 'bytes')
-        if (this.upstream) this.upstream.sendBuffer(packet)
-        else this.upQ.push(packet)
+      if (!this.startRelaying) return super.readPacket(packet) // our own login handshake
+      if (!this.upstream) {
+        this.upQ.push(packet)
         return
       }
-      return super.readPacket(packet)
+      this.flushUpQueue()
+      this.relayUp(packet)
+    }
+
+    relayUp (packet) {
+      const info = this.inspect(packet)
+      const name = info.des?.data.name
+      if (info.sub) {
+        this.downInLog(`${this.describe(info)}, ${packet.length} bytes`)
+        if (name === 'sub_client_login') this.server.emit('subClientLogin', this, info.sub)
+      } else if (info.error) {
+        this.downInLog(`${this.describe(info)} (could not decode: ${info.error.message}), relaying raw`)
+      } else {
+        this.downInLog('recv', name, info.des.data.params)
+        this.emit('serverbound', info.des.data, info.des)
+        if (info.des.canceled) return
+        if (name === 'client_cache_status') {
+          // The relay can't serve cached chunks, so keep the cache off upstream.
+          this.upstream.queue('client_cache_status', { enabled: !!this.server.enableChunkCaching })
+          return
+        }
+        if (name === 'set_local_player_as_initialized') this.status = 3
+      }
+      this.upstream.sendBuffer(packet)
     }
 
     flushUpQueue () {
       const queued = this.upQ
       this.upQ = []
-      for (const packet of queued) {
-        if (subClientBits(packet)) {
-          this.upstream.sendBuffer(packet)
-          continue
-        }
-        const des = this.server.deserializer.parsePacketBuffer(packet)
-        if (des.data.name === 'client_cache_status') continue // forced off for relaying
-        this.upstream.write(des.data.name, des.data.params)
-      }
+      for (const packet of queued) this.relayUp(packet)
     }
 
     // Remote → proxy → console
     readUpstream (packet) {
-      if (subClientBits(packet)) {
-        this.upInLog('Relaying sub-client packet raw', packet.length, 'bytes')
-        if (this.startRelaying) this.sendBuffer(packet)
-        else this.downQ.push(packet)
+      if (!this.startRelaying) {
+        this.downQ.push(packet)
         return
       }
-      return super.readUpstream(packet)
+      const info = this.inspect(packet)
+      const name = info.des?.data.name
+      const params = info.des?.data.params
+
+      if (info.sub) {
+        this.upInLog(`-> ${this.describe(info)}, ${packet.length} bytes`)
+        if (name === 'disconnect') this.server.emit('subClientKick', this, info.sub, params)
+        if (name === 'play_status') this.server.emit('subClientStatus', this, info.sub, params.status)
+        this.sendBuffer(packet)
+        return
+      }
+      if (info.error) {
+        this.upInLog(`-> ${this.describe(info)} (could not decode: ${info.error.message}), relaying raw`)
+        this.sendBuffer(packet)
+        return
+      }
+
+      this.upInLog('->', name, params)
+      // The proxy already sent its own login_success during the LAN handshake.
+      if (name === 'play_status' && params.status === 'login_success') return
+      this.emit('clientbound', info.des.data, info.des)
+      if (info.des.canceled) return
+      this._processOutbound(name, params) // keep item palette variables in sync for decoding
+
+      if (name === 'start_game') {
+        setTimeout(() => { this.sentStartGame = true }, 500)
+      } else if (name === 'level_chunk' && !this.sentStartGame) {
+        this.chunkSendCache.push(packet)
+        return
+      }
+      this.sendBuffer(packet, name === 'level_chunk') // chunks go out immediately, as before
+
+      if (this.chunkSendCache.length && this.sentStartGame) {
+        for (const chunk of this.chunkSendCache) this.sendBuffer(chunk, true)
+        this.chunkSendCache = []
+      }
     }
 
     flushDownQueue () {
       const queued = this.downQ
       this.downQ = []
-      for (const packet of queued) {
-        if (subClientBits(packet)) {
-          this.sendBuffer(packet)
-          continue
-        }
-        const des = this.server.deserializer.parsePacketBuffer(packet)
-        this.write(des.data.name, des.data.params)
-      }
+      for (const packet of queued) this.readUpstream(packet)
     }
   }
+}
+
+// NetherNet sends each message as up to 256 segments of 10,000 bytes, with the count in a
+// single byte. bedrock-protocol bundles everything queued in a 20 ms tick into one batch,
+// and a burst (like a split-screen player's whole world setup, ~3.5 MB) can exceed that,
+// silently wrapping the count and corrupting the stream. Cap batches well below the limit.
+const MAX_BATCH_BYTES = 1_000_000
+BedrockConnection.prototype._tick = function () {
+  if (!this.sendQ.length) return
+  const queued = this.sendQ
+  this.sendQ = []
+  this.sendIds = []
+  let chunk = []
+  let size = 0
+  const flush = () => {
+    if (!chunk.length) return
+    const batch = new Framer(this)
+    batch.addEncodedPackets(chunk)
+    if (this.encryptionEnabled) this.sendEncryptedBatch(batch)
+    else this.sendDecryptedBatch(batch)
+    chunk = []
+    size = 0
+  }
+  for (const packet of queued) {
+    if (size && size + packet.length > MAX_BATCH_BYTES) flush()
+    chunk.push(packet)
+    size += packet.length
+  }
+  flush()
+}
+
+// And refuse, loudly, to send a message that still wouldn't fit, instead of corrupting it.
+const sendNow = NethernetConnection.prototype.sendNow
+NethernetConnection.prototype.sendNow = function (data) {
+  if (data.length > 256 * 10_000) throw new Error(`NetherNet message too large (${data.length} bytes)`)
+  return sendNow.call(this, data)
 }
 
 class ProxyRelay extends Relay {
   constructor (options) {
     super(options)
-    this.RelayPlayer = withSubClientPassthrough(this.RelayPlayer)
+    const mcData = require('minecraft-data')('bedrock_' + this.options.version)
+    const names = mcData.protocol.types.mcpe_packet[1][0].type[1].mappings
+    this.RelayPlayer = withRawRelay(this.RelayPlayer, names)
   }
 
   async openUpstreamConnection (ds, clientAddr) {

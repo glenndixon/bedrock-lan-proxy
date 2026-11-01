@@ -9,6 +9,7 @@
 // the remote's server key was remembered (then enforced) by the trust store.
 
 const assert = require('node:assert')
+const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -192,18 +193,43 @@ async function main () {
     const toServer = Buffer.concat([varint(93 | (1 << 12)), Buffer.from('second player skin bytes')]) // player_skin, sub-client 1
     const toClient = Buffer.concat([varint(2 | (1 << 12)), Buffer.from([0, 0, 0, 3])]) // play_status, sub-client 1
     const remotePlayer = Object.values(remote.game.clients).find(p => p.profile?.name === 'LanTester')
-    const gotOnServer = new Promise(resolve => {
-      const read = remotePlayer.readPacket.bind(remotePlayer)
-      remotePlayer.readPacket = (packet) => (packet[1] & 0x30) ? resolve(Buffer.from(packet)) : read(packet)
-    })
-    const gotOnClient = new Promise(resolve => {
-      const read = client.readPacket.bind(client)
-      client.readPacket = (packet) => (packet[1] & 0x30) ? resolve(Buffer.from(packet)) : read(packet)
-    })
+    const isSub = (packet) => (packet[1] & 0x30) !== 0 // sub-client bits, for 2-byte headers
+    const onServer = []
+    const onClient = []
+    const waitFor = (list, n, what) => Promise.race([
+      new Promise(resolve => { const t = setInterval(() => { if (list.length >= n) { clearInterval(t); resolve() } }, 20) }),
+      timeout(20000, what)
+    ])
+    const readServer = remotePlayer.readPacket.bind(remotePlayer)
+    remotePlayer.readPacket = (packet) => isSub(packet) ? onServer.push(Buffer.from(packet)) : readServer(packet)
+    const readClient = client.readPacket.bind(client)
+    client.readPacket = (packet) => isSub(packet) ? onClient.push(Buffer.from(packet)) : readClient(packet)
+
     client.sendBuffer(toServer, true)
-    assert.deepStrictEqual(await Promise.race([gotOnServer, timeout(10000, 'sub-client packet to server')]), toServer)
+    await waitFor(onServer, 1, 'sub-client packet to server')
+    assert.deepStrictEqual(onServer[0], toServer)
     remotePlayer.sendBuffer(toClient, true)
-    assert.deepStrictEqual(await Promise.race([gotOnClient, timeout(10000, 'sub-client packet to client')]), toClient)
+    await waitFor(onClient, 1, 'sub-client packet to client')
+    assert.deepStrictEqual(onClient[0], toClient)
+
+    // A burst bigger than one NetherNet message can hold (~2.5 MB): random bytes so
+    // compression can't shrink it. All of it must arrive intact.
+    const burst = Array.from({ length: 7 }, () => Buffer.concat([varint(11 | (1 << 12)), crypto.randomBytes(500_000)]))
+    for (const packet of burst) remotePlayer.sendBuffer(packet)
+    await waitFor(onClient, 1 + burst.length, 'large sub-client burst')
+    assert.ok(onClient.slice(1).every((packet, i) => packet.equals(burst[i])), 'burst should arrive intact and in order')
+    step(`split-screen: a ${(burst.reduce((n, b) => n + b.length, 0) / 1e6).toFixed(1)} MB burst arrived intact`)
+
+    // The server kicking the split-screen player: reason decoded for the log, packet relayed raw.
+    const kickReason = new Promise(resolve => proxy.once('warn', resolve))
+    const disconnectBody = remote.game.serializer.createPacketBuffer({ name: 'disconnect', params: { reason: 'kicked', hide_disconnect_reason: false, message: 'disconnectionScreen.notAllowed', filtered_message: '' } }).subarray(1)
+    const subKick = Buffer.concat([varint(5 | (1 << 12)), disconnectBody])
+    remotePlayer.sendBuffer(subKick, true)
+    const warned = await Promise.race([kickReason, timeout(10000, 'sub-client kick reason')])
+    assert.match(warned, /split-screen player 1 .*disconnectionScreen\.notAllowed/)
+    await waitFor(onClient, 2 + burst.length, 'sub-client kick to client')
+    assert.ok(onClient.at(-1).equals(subKick))
+    step('split-screen: a kick for the second player was reported and passed through')
     assert.ok(remote.online.has('LanTester'), 'player one should still be connected')
     step('split-screen: sub-client packets crossed the proxy unchanged in both directions')
 
