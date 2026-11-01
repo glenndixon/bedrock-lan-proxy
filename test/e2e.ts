@@ -20,7 +20,7 @@ import { NethernetClient } from 'bedrock-protocol/src/nethernet/index.js'
 import { Server as NethernetServer, SignalStructure, SignalType } from 'nethernet'
 import type { Connection as NethernetConnection } from 'nethernet'
 import { getWebRTC } from 'nethernet/src/webrtc.js'
-import { LanProxy } from '../src/proxy.ts'
+import { LanProxy, signInMessage } from '../src/proxy.ts'
 import { createServerTrust } from '../src/trust.ts'
 import { writeVarint as varint } from '../src/relay.ts'
 import type { DisconnectParams } from '../src/types/internals.ts'
@@ -94,9 +94,20 @@ function earlyPacketCheck (): void {
   step('early packets: held until the player is registered, then delivered in order')
 }
 
+// The sign-in kick message is shown on the console's disconnect screen, which displays
+// formatting codes (§l, §r…) literally, so it must be plain text.
+function signInMessageCheck (): void {
+  const message = signInMessage('play.example.net', { user_code: 'W5S53QNN', verification_uri: 'https://www.microsoft.com/link' })
+  assert.ok(!message.includes('§'), 'sign-in message should have no formatting codes')
+  assert.match(message, /https:\/\/www\.microsoft\.com\/link/)
+  assert.match(message, /^W5S53QNN$/m, 'the code should be on a line of its own')
+  step('sign-in message: plain text, code on its own line')
+}
+
 async function main (): Promise<void> {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'blp-test-'))
   if (process.env.BLP_TRACE) (await import('../src/diagnostics.ts')).startDiagnostics(process.env.BLP_TRACE)
+  signInMessageCheck()
   await signalOrderCheck()
   earlyPacketCheck()
   const trustFile = path.join(tmp, 'known_servers.json')

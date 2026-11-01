@@ -316,17 +316,24 @@ export class LanProxy extends EventEmitter<LanProxyEvents> {
     // player and caches the token in profilesFolder.
     const who = playerName(player)
     this.emit('auth', { player: who, url: code.verification_uri, code: code.user_code })
-    player.disconnect(
-      `First time through this proxy: sign in to let it join ${this.opts.host} as you.\n\n` +
-      `Go to ${code.verification_uri} and enter code §l${code.user_code}§r\n\n` +
-      'Then reconnect from the Friends tab.'
-    )
+    player.disconnect(signInMessage(this.opts.host, code))
   }
 
   async stop (reason = 'Proxy shutting down'): Promise<void> {
     clearInterval(this.refreshTimer)
     if (this.relay) await this.relay.close(reason)
   }
+}
+
+/**
+ * What a player sees when they're sent off to sign in. Plain text only: the disconnect
+ * screen shows Minecraft's § formatting codes literally instead of applying them.
+ */
+export function signInMessage (host: string, code: MsaCode): string {
+  return `First time through this proxy: sign in to let it join ${host} as you.\n\n` +
+    `Go to ${code.verification_uri} and enter this code:\n\n` +
+    `${code.user_code}\n\n` +
+    'Then reconnect from the Friends tab.'
 }
 
 function playerName (player: RelayPlayerInternals | undefined): string {
