@@ -12,12 +12,14 @@
 // sent to, so it can't simply be forwarded.)
 
 const { EventEmitter } = require('node:events')
+const crypto = require('node:crypto')
 const path = require('node:path')
 const os = require('node:os')
-const { Relay } = require('bedrock-protocol')
+const { ProxyRelay } = require('./relay')
 const { pingHttp } = require('nethernet')
 const bpOptions = require('bedrock-protocol/src/options')
 const { installHttpSignalling } = require('./upstream')
+const { installLanFixes } = require('./lanFixes')
 const { createServerTrust } = require('./trust')
 
 const { Versions, CURRENT_VERSION } = bpOptions
@@ -29,6 +31,7 @@ const DEFAULT_TRUST_FILE = path.join(STATE_DIR, 'known_servers.json')
 const GAME_TYPES = { survival: 0, creative: 1, adventure: 2, spectator: 6 }
 
 installHttpSignalling()
+installLanFixes()
 
 /** The HTTP signalling origin for a remote: http://host:port, or a URL the user gave. */
 function remoteOrigin (host, port) {
@@ -123,6 +126,8 @@ class LanProxy extends EventEmitter {
     this.remoteUp = false
     this.relay = null
     this.players = new Set()
+    // Dedicated servers put a random 16-hex-digit nonce in their LAN advertisement.
+    this.nonce = crypto.randomBytes(8).toString('hex')
   }
 
   async start () {
@@ -147,7 +152,7 @@ class LanProxy extends EventEmitter {
     })
 
     let relay
-    this.relay = relay = new Relay({
+    this.relay = relay = new ProxyRelay({
       transport: 'nethernet',
       version,
       host: o.bind, // node-nethernet binds its LAN discovery socket (UDP 7551) here
@@ -178,6 +183,12 @@ class LanProxy extends EventEmitter {
     relay.on('join', (player) => {
       this.emit('info', `${playerName(player)} is now connected to ${this.origin}`)
     })
+    relay.on('upstreamKick', (player, packet) => {
+      this.emit('warn', `${this.origin} disconnected ${playerName(player)}: ${packet.message || '(no reason given)'}`)
+    })
+    relay.on('upstreamCancelled', (player) => {
+      this.emit('debug', `${playerName(player)} left before reaching ${this.origin}; cancelled their upstream connection`)
+    })
     relay.on('error', err => this.emit('error', err))
 
     await relay.listen()
@@ -197,6 +208,11 @@ class LanProxy extends EventEmitter {
     // Show the remote's population so people know who's on; fall back to our own count.
     ad.playerCount = r?.playersMax && this.remoteUp ? r.playersOnline : this.players.size
     ad.playersMax = r?.playersMax || o.maxPlayers
+    ad.nonce = this.nonce
+    if (!this._adLogged) {
+      this._adLogged = true
+      this.emit('debug', `LAN advertisement: ${JSON.stringify({ ...ad, raw: undefined })}`)
+    }
     return ad
   }
 
@@ -213,8 +229,13 @@ class LanProxy extends EventEmitter {
 
   _trackPlayer (player) {
     this.players.add(player)
+    const addr = player.connection?.address
+    this.emit('debug', `LAN connection ${addr} open (WebRTC data channels up), waiting for login`)
+    player.on('loggingIn', () => this.emit('debug', `LAN connection ${addr} sent login`))
     player.on('login', () => this.emit('info', `${playerName(player)} found the LAN game and is signing in`))
-    player.on('close', () => {
+    player.on('join', () => this.emit('debug', `${playerName(player)} logged in to the proxy; connecting upstream to ${this.origin}`))
+    player.on('close', (reason) => {
+      this.emit('debug', `LAN connection ${addr} closed${reason ? `: ${reason}` : ''}`)
       if (this.players.delete(player)) this.emit('info', `${playerName(player)} left`)
     })
   }

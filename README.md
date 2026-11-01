@@ -82,6 +82,19 @@ verified through TLS instead.
   plus WebRTC traffic on random UDP ports, and outbound TCP to the remote's game port.
 - **Don't run Minecraft on the proxy machine at the same time.** Both want UDP port 7551.
 
+## Troubleshooting
+
+If the game shows up in the LAN list but joining fails or times out, run with `--debug`:
+
+```sh
+bedrock-lan-proxy play.example.net --debug
+```
+
+Then try to join, wait for it to fail, and press Ctrl+C. `bedrock-lan-proxy.log` in the
+current folder (or `--log-file <path>`) has every step: signalling messages from the
+console, WebRTC/ICE state on both legs, the login, and the upstream connection. The last
+step that appears is where the join stalled.
+
 ## How it works
 
 - **LAN side:** node-nethernet answers discovery broadcasts on UDP 7551 with an
@@ -93,6 +106,18 @@ verified through TLS instead.
   newer than the npm release of node-nethernet, so the dependency is pinned to a GitHub
   commit. `src/upstream.js` plugs it into bedrock-protocol, which otherwise only knows LAN
   and Xbox-services signalling.
+- **Real-client fixes** (`src/lanFixes.js`): the proxy sends its WebRTC answer before
+  its ICE candidates, because the game can't apply a candidate it receives first, and
+  includes a random `nonce` in its advertisement like dedicated servers do.
+- **Upstream lifetime** (`src/relay.js`): if a player leaves before their upstream
+  connection is ready (for example after being kicked to sign in), it's cancelled rather
+  than left to log in to the remote on its own. Otherwise their next attempt would be a
+  second login for an account that's already online. Kicks from the remote are passed to
+  the player with the server's own reason.
+- **Split-screen** (`src/relay.js`): extra local players on a console are sub-clients
+  sharing the first player's connection. bedrock-protocol can't decode their packets, so
+  the proxy forwards them byte for byte (NetherNet has no game-layer encryption, so this
+  is safe). Each split-screen player signs in to the remote with their own account.
 - **In between:** bedrock-protocol's `Relay` terminates each client's game session and
   opens a matching one upstream.
 - **No RakNet:** bedrock-protocol still lists native RakNet modules as dependencies.

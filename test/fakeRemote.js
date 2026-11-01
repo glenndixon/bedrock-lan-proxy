@@ -17,7 +17,7 @@ const { Versions } = require('bedrock-protocol/src/options')
 const { SignalStructure, SignalType } = require('nethernet')
 const { attachIdentity } = require('nethernet/src/signalling/sdpIdentity')
 
-async function startFakeRemote ({ host = '127.0.0.1', port, version, motd, levelName }) {
+async function startFakeRemote ({ host = '127.0.0.1', port, version, motd, levelName, answerDelayMs = 0 }) {
   // Game server on NetherNet. Skip listen(): it would bind LAN discovery on UDP 7551,
   // which the proxy under test needs. Wire the transport up by hand instead.
   const game = new BedrockServer({ transport: 'nethernet', offline: true, version })
@@ -26,6 +26,22 @@ async function startFakeRemote ({ host = '127.0.0.1', port, version, motd, level
   game.transport.onCloseConnection = game.onCloseConnection
   game.transport.onEncapsulated = game.onEncapsulated
   const nethernet = game.transport.nethernet
+
+  // Like a real server: an account can only be online once. A second login is refused.
+  const online = new Set()
+  const joins = [] // names that joined, for assertions
+  game.on('connect', player => {
+    player.once('join', () => {
+      const name = player.profile.name
+      if (online.has(name)) {
+        player.disconnect('disconnectionScreen.loggedinOtherLocation')
+        return
+      }
+      online.add(name)
+      joins.push(name)
+      player.once('close', () => online.delete(name))
+    })
+  })
 
   // The operator key the answer is signed with; clients pin its fingerprint.
   const operator = crypto.generateKeyPairSync('ec', { namedCurve: 'secp384r1' })
@@ -57,6 +73,9 @@ async function startFakeRemote ({ host = '127.0.0.1', port, version, motd, level
       let offer = ''
       for await (const chunk of req) offer += chunk
       offers.push({ clientNetworkId: m[1], sdp: offer })
+      // Simulate a slow path to the server (e.g. a player still signing in to Microsoft).
+      if (answerDelayMs) await new Promise(resolve => setTimeout(resolve, answerDelayMs))
+      if (req.socket.destroyed) return // client gave up
 
       const connectionId = crypto.randomBytes(8).readBigUInt64BE()
       const signal = new SignalStructure(SignalType.ConnectRequest, connectionId, offer, BigInt(m[1]))
@@ -84,6 +103,8 @@ async function startFakeRemote ({ host = '127.0.0.1', port, version, motd, level
     game,
     fingerprint,
     offers,
+    joins,
+    online,
     url: `http://${host}:${port}`,
     async close () {
       server.closeAllConnections()

@@ -36,7 +36,8 @@ Options:
       --profiles <dir>     Where upstream sign-in tokens are cached
                            (default ${DEFAULT_PROFILES})
       --webrtc <backend>   werift (default), wrtc, or auto
-      --debug              Show extra diagnostic messages
+      --debug              Write a detailed connection trace to a log file
+      --log-file <path>    Where --debug writes (default ./bedrock-lan-proxy.log)
       --log-packets        Print every relayed packet (very noisy)
       --list-versions      Print supported game versions and exit
   -h, --help               Show this help
@@ -69,6 +70,7 @@ try {
       webrtc: { type: 'string' },
       'server-key': { type: 'string' },
       debug: { type: 'boolean' },
+      'log-file': { type: 'string' },
       'log-packets': { type: 'boolean' },
       'list-versions': { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
@@ -107,7 +109,20 @@ if (v.webrtc && !['werift', 'wrtc', 'auto'].includes(v.webrtc)) fail('--webrtc m
 if (v['server-key'] && !/^sha256:[0-9a-f]{64}$/.test(v['server-key'])) fail('--server-key must look like sha256:<64 lowercase hex digits>')
 
 const stamp = () => new Date().toLocaleTimeString()
-const log = (...a) => console.log(`[${stamp()}]`, ...a)
+let trace = null
+if (v.debug) {
+  const path = require('node:path')
+  const { startDiagnostics } = require('../src/diagnostics')
+  trace = startDiagnostics(path.resolve(v['log-file'] || 'bedrock-lan-proxy.log'))
+  trace.write('args:', JSON.stringify(process.argv.slice(2)))
+  // --log-packets prints through console.debug; keep a copy in the trace too.
+  const consoleDebug = console.debug
+  console.debug = (...a) => { consoleDebug(...a); trace.write(...a) }
+}
+const log = (...a) => {
+  console.log(`[${stamp()}]`, ...a)
+  trace?.write(...a)
+}
 
 const proxy = new LanProxy({
   host,
@@ -126,7 +141,7 @@ const proxy = new LanProxy({
 
 proxy.on('info', msg => log(msg))
 proxy.on('warn', msg => log('warning:', msg))
-if (v.debug) proxy.on('debug', msg => log('debug:', msg))
+if (v.debug) proxy.on('debug', msg => trace.write(msg))
 proxy.on('remote', r => log(r.motd
   ? `Remote ${proxy.origin} → "${r.motd}" v${r.version ?? '?'}, ${r.playersOnline}/${r.playersMax} online`
   : `Remote ${proxy.origin} is reachable but publishes no name or version`))
@@ -141,6 +156,7 @@ proxy.on('listening', ({ networkId, version }) => {
     .filter(i => i && i.family === 'IPv4' && !i.internal).map(i => i.address)
   log(`LAN game is up (NetherNet id ${networkId}). Bedrock ${version} clients on ${v.bind || ips.join(', ') || 'this network'} should see it under Friends → LAN Games.`)
   if (v.offline) log('Joining the remote in offline mode (no Xbox sign-in upstream).')
+  if (trace) log(`Writing a debug trace to ${trace.file}`)
   log('Press Ctrl+C to stop.')
 })
 
