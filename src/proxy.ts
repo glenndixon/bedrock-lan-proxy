@@ -211,7 +211,9 @@ export class LanProxy extends EventEmitter<LanProxyEvents> {
       log: (level, msg) => this.emit(level, msg)
     })
 
-    const relay = new ProxyRelay({
+    // Annotated because advertisementFn below refers back to `relay`: without it,
+    // TypeScript 5/6 can't infer the type through that self-reference (TS7022).
+    const relay: ProxyRelay = new ProxyRelay({
       transport: 'nethernet',
       version,
       host: o.bind, // node-nethernet binds its LAN discovery socket (UDP 7551) here
