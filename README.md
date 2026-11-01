@@ -54,9 +54,12 @@ Run `bedrock-lan-proxy --help` for all options.
 
 ## First join: one-time sign-in
 
-A Bedrock login is signed for the server it's sent to, so the proxy can't pass a player's
-login straight through. Instead it joins the remote **as that player** using their own
-Microsoft account:
+A Bedrock login is tied to the device that made it: Microsoft issues the token to that
+device's own private key, and the server checks that the connection is signed with that
+key. The key never leaves the console, so the proxy can't pass a player's login straight
+through. That's deliberate: it's what stops anything in the middle of a connection from
+reusing your login. Instead the proxy gets its own login for that player's Microsoft
+account, like any new device signing in, and joins the remote **as that player**:
 
 1. The first time someone joins, they're disconnected with a message like
    *"Go to microsoft.com/link and enter code ABCD1234"* (it's printed in the proxy's terminal too).

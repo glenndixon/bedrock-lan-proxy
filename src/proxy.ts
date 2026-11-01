@@ -6,8 +6,9 @@
 //
 // node-nethernet handles discovery, signalling and the WebRTC data channels on both
 // sides. bedrock-protocol's Relay terminates each client's game session and opens a
-// matching session to the remote as that player. (A login is signed for the server it's
-// sent to, so it can't simply be forwarded.)
+// matching session to the remote as that player. (A login is tied to the private key of
+// the device that made it, and the remote checks the connection is signed with that key,
+// so the proxy can't forward it; it signs in for the player with its own key instead.)
 
 import { EventEmitter } from 'node:events'
 import crypto from 'node:crypto'
